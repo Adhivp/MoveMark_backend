@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
 from sqlalchemy.orm import Session
 from sqlalchemy import func, case, extract
 from typing import List, Optional
@@ -9,15 +10,36 @@ from collections import defaultdict
 # Local imports
 from database import engine, get_db
 from models import Base, Employee, Attendance
-from routers import employee, attendance , leave_request
+from routers import employee, attendance , leave_request , analytics
 # Create tables
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
-    title="MoveMark backend API",
-    description="API for managing employee attendance",
+    title="MoveMark API",
+    description="Attendance Management System API with Anomaly Detection",
     version="1.0.0"
 )
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    
+    openapi_schema = get_openapi(
+        title="MoveMark API",
+        version="1.0.0",
+        description="Attendance Management System API with Anomaly Detection",
+        routes=app.routes,
+    )
+    
+    # Customize the schema for better Swagger UI display
+    for path in openapi_schema["paths"]:
+        if "/anomalies" in path:
+            openapi_schema["paths"][path]["get"]["parameters"][0]["x-slider"] = True
+    
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+app.openapi = custom_openapi
 
 # Configure CORS
 app.add_middleware(
@@ -32,6 +54,7 @@ app.add_middleware(
 app.include_router(employee.router)
 app.include_router(attendance.router)
 app.include_router(leave_request.router)
+app.include_router(analytics.router) 
 
 @app.get("/")
 def read_root():

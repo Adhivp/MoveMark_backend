@@ -13,7 +13,7 @@ router = APIRouter(
 
 @router.post("/", response_model=schemas.Employee)
 def create_employee(employee: schemas.EmployeeCreate, db: Session = Depends(get_db)):
-    db_employee = Employee(**employee.dict())  # Use Employee directly
+    db_employee = Employee(**employee.dict())
     db.add(db_employee)
     db.commit()
     db.refresh(db_employee)
@@ -41,7 +41,6 @@ def get_employees(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)
         emp_dict['present_days'] = present_days
         emp_dict['attendance_percentage'] = round((present_days / total_attendance * 100), 2) if total_attendance > 0 else 0
         result.append(emp_dict)
-    
     return result
 
 @router.get("/{employee_id}", response_model=schemas.Employee) 

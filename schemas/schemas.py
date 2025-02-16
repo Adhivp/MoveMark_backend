@@ -13,9 +13,12 @@ class EmployeeCreate(EmployeeBase):
 class Employee(EmployeeBase):
     employee_id: int
     created_at: datetime
+    total_working_days_after_joining: Optional[int] = None
+    present_days: Optional[int] = None
+    attendance_percentage: Optional[float] = None
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
 class AttendanceBase(BaseModel):
     employee_id: int

@@ -1,12 +1,16 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import func, and_
+from sqlalchemy import func, and_, case
 from typing import List, Dict
 from database import get_db
 from models import Employee, Attendance, LeaveRequest
 from datetime import datetime, timedelta
 from pydantic import BaseModel
 from typing import Optional, List
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+import numpy as np
+import pandas as pd
 
 router = APIRouter(
     prefix="/analytics",
@@ -17,6 +21,12 @@ class AnomalyLevel:
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
+
+class AnomalyType:
+    LATE_CHECKIN = "Late Check-in"
+    EARLY_CHECKOUT = "Early Check-out"
+    LOW_ATTENDANCE = "Low Attendance"
+    IRREGULAR_PATTERN = "Irregular Pattern"
 
 class AttendanceAnomaly(BaseModel):
     employee_id: int
@@ -30,101 +40,113 @@ class AttendanceAnomaly(BaseModel):
     class Config:
         orm_mode = True
 
+class AttendanceFeatures(BaseModel):
+    checkin_times: List[float]  # Minutes since midnight
+    checkout_times: List[float]
+    attendance_rate: float
+
+def extract_features(employee_data, db: Session):
+    # Convert times to minutes since midnight for numerical analysis
+    checkins = [t.hour * 60 + t.minute if t else 0 for t in employee_data['checkin_time']]
+    checkouts = [t.hour * 60 + t.minute if t else 0 for t in employee_data['checkout_time']]
+    
+    # Calculate attendance rate
+    attendance_rate = len([s for s in employee_data['status'] if s == 'present']) / len(employee_data['status'])
+    
+    return AttendanceFeatures(
+        checkin_times=checkins,
+        checkout_times=checkouts,
+        attendance_rate=attendance_rate
+    )
+
 @router.get("/anomalies", response_model=List[AttendanceAnomaly])
-def detect_anomalies(db: Session = Depends(get_db)):
+def detect_anomalies(
+    anomaly_threshold: float = Query(
+        default=0.5,
+        ge=0.0,  # least strict (more anomalies)
+        le=1.0,  # most strict (fewer anomalies)
+        description="Anomaly detection threshold (0.0 to 1.0). Higher values are more strict (fewer anomalies), lower values detect more anomalies.",
+    ),
+    db: Session = Depends(get_db)
+):
     anomalies = []
     
-    # Get all employees
-    employees = db.query(Employee).all()
+    # Get all attendance data
+    attendance_data = pd.read_sql(
+        db.query(Attendance).statement,
+        db.bind
+    )
     
-    for employee in employees:
-        # 1. Late Check-in Pattern Analysis
-        late_checkins = db.query(Attendance).filter(
-            and_(
-                Attendance.employee_id == employee.employee_id,
-                Attendance.checkin_time > datetime.strptime('09:30:00', '%H:%M:%S').time()
-            )
-        ).count()
+    for employee_id, emp_data in attendance_data.groupby('employee_id'):
+        employee = db.query(Employee).filter(Employee.employee_id == employee_id).first()
         
-        if late_checkins > 5:
-            severity = AnomalyLevel.HIGH if late_checkins > 10 else AnomalyLevel.MEDIUM
-            anomalies.append(AttendanceAnomaly(
-                employee_id=employee.employee_id,
-                employee_name=employee.employee_name,
-                anomaly_type="Frequent Late Check-ins",
-                description=f"Employee has {late_checkins} late check-ins",
-                severity=severity,
-                detected_date=datetime.now(),
-                anomaly_score=min(late_checkins / 20, 1.0)
-            ))
-
-        # 2. Absence Without Leave Request
-        absences = db.query(Attendance).filter(
-            and_(
-                Attendance.employee_id == employee.employee_id,
-                Attendance.status == "absent"
-            )
-        ).all()
+        features = extract_features(emp_data, db)
         
-        for absence in absences:
-            leave_request = db.query(LeaveRequest).filter(
-                and_(
-                    LeaveRequest.employee_id == employee.employee_id,
-                    LeaveRequest.date_to_be_on_leave == absence.date
+        # Prepare data for Isolation Forest
+        X = np.array([
+            features.checkin_times,
+            features.checkout_times,
+            [features.attendance_rate] * len(features.checkin_times)
+        ]).T
+        
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+        
+        clf = IsolationForest(
+            contamination=0.1,
+            random_state=42,
+            n_estimators=100
+        )
+        
+        clf.fit(X_scaled)
+        anomaly_scores = clf.score_samples(X_scaled)
+        
+        # Convert the threshold from 0-1 range to isolation forest score range
+        # Isolation Forest scores are typically between -0.5 and 0.5
+        adjusted_threshold = -1 * (1 - anomaly_threshold)  # Convert 0-1 to 0 to -1
+        
+        # Use adjusted threshold for detection
+        for idx, score in enumerate(anomaly_scores):
+            if score < adjusted_threshold:
+                date = emp_data.iloc[idx]['date']
+                checkin = emp_data.iloc[idx]['checkin_time']
+                checkout = emp_data.iloc[idx]['checkout_time']
+                
+                # Determine anomaly type based on patterns
+                if checkin and checkin.hour >= 9:
+                    anomaly_type = AnomalyType.LATE_CHECKIN
+                elif checkout and checkout.hour <= 16:
+                    anomaly_type = AnomalyType.EARLY_CHECKOUT
+                elif features.attendance_rate < 0.8:
+                    anomaly_type = AnomalyType.LOW_ATTENDANCE
+                else:
+                    anomaly_type = AnomalyType.IRREGULAR_PATTERN
+                
+                # Dynamic severity based on normalized score difference
+                score_diff = (adjusted_threshold - score) / 2  # Normalize to 0-1 range
+                severity = (
+                    AnomalyLevel.HIGH if score_diff > 0.5 else
+                    AnomalyLevel.MEDIUM if score_diff > 0.25 else
+                    AnomalyLevel.LOW
                 )
-            ).first()
-            
-            if not leave_request:
+                
+                description = f"Unusual attendance pattern detected on {date} "
+                description += f"(Anomaly Score: {score:.3f}). "
+                if checkin and checkin.hour >= 9:
+                    description += "Late check-in. "
+                if checkout and checkout.hour <= 16:
+                    description += "Early checkout. "
+                if features.attendance_rate < 0.8:
+                    description += "Low attendance rate. "
+                
                 anomalies.append(AttendanceAnomaly(
-                    employee_id=employee.employee_id,
+                    employee_id=employee_id,
                     employee_name=employee.employee_name,
-                    anomaly_type="Unauthorized Absence",
-                    description=f"Absence without leave request on {absence.date}",
-                    severity=AnomalyLevel.HIGH,
+                    anomaly_type=anomaly_type,
+                    description=description,
+                    severity=severity,
                     detected_date=datetime.now(),
-                    anomaly_score=1.0
+                    anomaly_score=abs(score)
                 ))
-
-        # 3. Early Checkout Pattern
-        early_checkouts = db.query(Attendance).filter(
-            and_(
-                Attendance.employee_id == employee.employee_id,
-                Attendance.checkout_time < datetime.strptime('17:00:00', '%H:%M:%S').time()
-            )
-        ).count()
-        
-        if early_checkouts > 5:
-            severity = AnomalyLevel.MEDIUM if early_checkouts > 8 else AnomalyLevel.LOW
-            anomalies.append(AttendanceAnomaly(
-                employee_id=employee.employee_id,
-                employee_name=employee.employee_name,
-                anomaly_type="Frequent Early Checkouts",
-                description=f"Employee has {early_checkouts} early checkouts",
-                severity=severity,
-                detected_date=datetime.now(),
-                anomaly_score=early_checkouts / 15
-            ))
-
-        # 4. Attendance Pattern Changes
-        last_month = datetime.now() - timedelta(days=30)
-        attendance_pattern = db.query(
-            func.avg(case((Attendance.status == 'present', 1), else_=0))
-        ).filter(
-            and_(
-                Attendance.employee_id == employee.employee_id,
-                Attendance.date >= last_month
-            )
-        ).scalar()
-
-        if attendance_pattern and attendance_pattern < 0.8: 
-            anomalies.append(AttendanceAnomaly(
-                employee_id=employee.employee_id,
-                employee_name=employee.employee_name,
-                anomaly_type="Low Attendance Pattern",
-                description=f"Attendance rate of {attendance_pattern*100:.1f}% in last 30 days",
-                severity=AnomalyLevel.MEDIUM,
-                detected_date=datetime.now(),
-                anomaly_score=1 - attendance_pattern
-            ))
-
+    
     return sorted(anomalies, key=lambda x: x.anomaly_score, reverse=True)
