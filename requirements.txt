@@ -1,0 +1,11 @@
+fastapi>=0.68.0
+uvicorn>=0.15.0
+sqlalchemy>=1.4.23
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+pydantic[email]
+python-dateutil>=2.8.2
+holidays==0.66
+prophet
+pandas
+numpy
