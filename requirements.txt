@@ -9,3 +9,4 @@ holidays==0.66
 prophet
 pandas
 numpy
+sckit-learn
